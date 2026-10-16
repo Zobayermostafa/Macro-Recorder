@@ -1,4 +1,4 @@
-﻿#ifndef UNICODE
+#ifndef UNICODE
 #define UNICODE
 #endif
 #ifndef _UNICODE
@@ -446,18 +446,61 @@ void EditTimelineCell(int itemIndex, int subItem) {
         currentVal = events[itemIndex].delayMs;
     }
 
-    HWND hInputWnd = CreateWindowExW(
-        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        L"#32770", title.c_str(),
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        0, 0, 260, 135, g_hWnd, NULL, NULL, NULL
-    );
+    struct DlgData {
+        HWND hEdit;
+        bool confirmed;
+        int value;
+    } dlgData = { NULL, false, 0 };
+
+    WNDPROC oldWndProc = NULL;
+    // Subclass or use DefDlgProc with custom message handler
+    auto DlgProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        DlgData* pData = reinterpret_cast<DlgData*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        if (msg == WM_COMMAND) {
+            int id = LOWORD(wParam);
+            if (id == IDOK && pData && pData->hEdit) {
+                wchar_t buf[32];
+                GetWindowTextW(pData->hEdit, buf, 32);
+                pData->value = _wtoi(buf);
+                pData->confirmed = true;
+                DestroyWindow(hWnd);
+                return 0;
+            } else if (id == IDCANCEL) {
+                DestroyWindow(hWnd);
+                return 0;
+            }
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    };
+
+    const wchar_t DLG_CLASS_NAME[] = L"KeyTaskValueEditorClass";
+    static bool s_classRegistered = false;
+    if (!s_classRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = DlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = DLG_CLASS_NAME;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassW(&wc);
+        s_classRegistered = true;
+    }
 
     RECT parentRect;
     GetWindowRect(g_hWnd, &parentRect);
-    SetWindowPos(hInputWnd, NULL,
+
+    HWND hInputWnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        DLG_CLASS_NAME, title.c_str(),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
         parentRect.left + 90, parentRect.top + 140,
-        260, 135, SWP_NOZORDER);
+        260, 145,
+        g_hWnd, NULL, GetModuleHandleW(NULL), NULL
+    );
+
+    if (!hInputWnd) return;
+
+    SetWindowLongPtrW(hInputWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&dlgData));
 
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
@@ -467,15 +510,16 @@ void EditTimelineCell(int itemIndex, int subItem) {
 
     HWND hEdit = CreateWindowW(L"EDIT", std::to_wstring(currentVal).c_str(),
         WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
-        20, 38, 205, 22, hInputWnd, (HMENU)201, NULL, NULL);
+        20, 38, 205, 24, hInputWnd, (HMENU)201, NULL, NULL);
     SendMessageW(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+    dlgData.hEdit = hEdit;
 
     HWND hBtnOk = CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-        50, 68, 70, 24, hInputWnd, (HMENU)IDOK, NULL, NULL);
+        45, 72, 70, 26, hInputWnd, (HMENU)IDOK, NULL, NULL);
     SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     HWND hBtnCancel = CreateWindowW(L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-        135, 68, 70, 24, hInputWnd, (HMENU)IDCANCEL, NULL, NULL);
+        135, 72, 70, 26, hInputWnd, (HMENU)IDCANCEL, NULL, NULL);
     SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     EnableWindow(g_hWnd, FALSE);
@@ -483,52 +527,14 @@ void EditTimelineCell(int itemIndex, int subItem) {
     SendMessageW(hEdit, EM_SETSEL, 0, -1);
 
     MSG msg = {};
-    bool done = false;
-    while (!done && GetMessageW(&msg, NULL, 0, 0)) {
-        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
-            done = true;
-            break;
-        }
-        if (msg.message == WM_COMMAND) {
-            int id = LOWORD(msg.wParam);
-            if (id == IDOK) {
-                wchar_t buf[32];
-                GetWindowTextW(hEdit, buf, 32);
-                int newVal = _wtoi(buf);
-                if (newVal >= 0) {
-                    if (isHoldDuration) {
-                        // Adjust the key up event delay so that the hold time matches newVal
-                        uint16_t vk = events[itemIndex].vkCode;
-                        int downIdx = -1;
-                        uint32_t intermediateDelay = 0;
-                        for (int i = itemIndex - 1; i >= 0; i--) {
-                            if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
-                                downIdx = i;
-                                break;
-                            }
-                            intermediateDelay += events[i + 1].delayMs;
-                        }
-                        if (downIdx != -1) {
-                            if (static_cast<uint32_t>(newVal) >= intermediateDelay) {
-                                events[downIdx + 1].delayMs = static_cast<uint32_t>(newVal) - intermediateDelay;
-                            } else {
-                                events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
-                            }
-                        }
-                    } else {
-                        events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
-                    }
-
-                    MacroRecorder::Instance().SetEvents(events);
-                    g_isUnsaved = true;
-                    UpdateUIStatus();
-                    RefreshTimelineList();
-                }
-                done = true;
-                break;
-            } else if (id == IDCANCEL) {
-                done = true;
-                break;
+    while (IsWindow(hInputWnd) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(hInputWnd, WM_COMMAND, MAKEWPARAM(IDOK, 0), (LPARAM)hBtnOk);
+                continue;
+            } else if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(hInputWnd, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), (LPARAM)hBtnCancel);
+                continue;
             }
         }
         TranslateMessage(&msg);
@@ -536,8 +542,37 @@ void EditTimelineCell(int itemIndex, int subItem) {
     }
 
     EnableWindow(g_hWnd, TRUE);
-    DestroyWindow(hInputWnd);
     SetFocus(g_hListTimeline);
+
+    if (dlgData.confirmed && dlgData.value >= 0) {
+        int newVal = dlgData.value;
+        if (isHoldDuration) {
+            uint16_t vk = events[itemIndex].vkCode;
+            int downIdx = -1;
+            uint32_t intermediateDelay = 0;
+            for (int i = itemIndex - 1; i >= 0; i--) {
+                if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
+                    downIdx = i;
+                    break;
+                }
+                intermediateDelay += events[i + 1].delayMs;
+            }
+            if (downIdx != -1) {
+                if (static_cast<uint32_t>(newVal) >= intermediateDelay) {
+                    events[downIdx + 1].delayMs = static_cast<uint32_t>(newVal) - intermediateDelay;
+                } else {
+                    events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
+                }
+            }
+        } else {
+            events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
+        }
+
+        MacroRecorder::Instance().SetEvents(events);
+        g_isUnsaved = true;
+        UpdateUIStatus();
+        RefreshTimelineList();
+    }
 }
 
 void PromptEditDelay() {
