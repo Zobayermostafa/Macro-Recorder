@@ -38,6 +38,7 @@
 #define IDC_BTN_EDIT_DELAY  117
 #define IDC_BTN_DEL_EVENT   118
 #define IDC_BTN_CLEAR_ALL   119
+#define IDC_BTN_ADD_EVENT   120
 
 // Hotkey IDs
 #define HOTKEY_RECORD_STOP  1
@@ -65,6 +66,7 @@ static HWND g_hListTimeline = NULL;
 static HWND g_hBtnEditDelay = NULL;
 static HWND g_hBtnDelEvent = NULL;
 static HWND g_hBtnClearAll = NULL;
+static HWND g_hBtnAddEvent = NULL;
 
 static bool g_isTimelineOpen = false;
 static bool g_isUnsaved = false;
@@ -84,6 +86,8 @@ static HBRUSH g_hBrushGray  = NULL;
 bool SaveMacroDialog();
 void RefreshTimelineList();
 void EditTimelineCell(int itemIndex, int subItem);
+void PromptAddEvent();
+void PromptEditKey(int itemIndex);
 
 void SetTimelineOpen(bool open) {
     g_isTimelineOpen = open;
@@ -95,6 +99,7 @@ void SetTimelineOpen(bool open) {
 
     int showCmd = g_isTimelineOpen ? SW_SHOW : SW_HIDE;
     ShowWindow(g_hListTimeline, showCmd);
+    ShowWindow(g_hBtnAddEvent, showCmd);
     ShowWindow(g_hBtnEditDelay, showCmd);
     ShowWindow(g_hBtnDelEvent, showCmd);
     ShowWindow(g_hBtnClearAll, showCmd);
@@ -575,6 +580,328 @@ void EditTimelineCell(int itemIndex, int subItem) {
     }
 }
 
+// Edit key (e.g. change 'f' to 's', or change from Down to Up)
+void PromptEditKey(int itemIndex) {
+    auto events = MacroRecorder::Instance().GetEvents();
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(events.size())) return;
+
+    struct KeyDlgData {
+        HWND hEditKey;
+        HWND hComboAction;
+        bool confirmed;
+        std::wstring keyStr;
+        bool isUp;
+    } dlgData = { NULL, NULL, false, L"", false };
+
+    auto KeyDlgProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        KeyDlgData* pData = reinterpret_cast<KeyDlgData*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        if (msg == WM_COMMAND) {
+            int id = LOWORD(wParam);
+            if (id == IDOK && pData) {
+                wchar_t buf[64];
+                GetWindowTextW(pData->hEditKey, buf, 64);
+                pData->keyStr = buf;
+                int sel = (int)SendMessageW(pData->hComboAction, CB_GETCURSEL, 0, 0);
+                pData->isUp = (sel == 1);
+                pData->confirmed = true;
+                DestroyWindow(hWnd);
+                return 0;
+            } else if (id == IDCANCEL) {
+                DestroyWindow(hWnd);
+                return 0;
+            }
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    };
+
+    const wchar_t KEY_DLG_CLASS[] = L"KeyTaskEditKeyClass";
+    static bool s_keyClassRegistered = false;
+    if (!s_keyClassRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = KeyDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = KEY_DLG_CLASS;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassW(&wc);
+        s_keyClassRegistered = true;
+    }
+
+    RECT parentRect;
+    GetWindowRect(g_hWnd, &parentRect);
+
+    HWND hDlgWnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        KEY_DLG_CLASS, L"Edit Key Event",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        parentRect.left + 85, parentRect.top + 130,
+        270, 185,
+        g_hWnd, NULL, GetModuleHandleW(NULL), NULL
+    );
+
+    if (!hDlgWnd) return;
+
+    SetWindowLongPtrW(hDlgWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&dlgData));
+
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    HWND hLblKey = CreateWindowW(L"STATIC", L"Key (e.g. s, Enter, Space, Shift):", WS_VISIBLE | WS_CHILD,
+        20, 12, 220, 20, hDlgWnd, NULL, NULL, NULL);
+    SendMessageW(hLblKey, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    std::wstring curKeyName = GetKeyDisplayName(events[itemIndex].vkCode, events[itemIndex].scanCode, events[itemIndex].flags);
+    dlgData.hEditKey = CreateWindowW(L"EDIT", curKeyName.c_str(),
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        20, 32, 215, 24, hDlgWnd, (HMENU)301, NULL, NULL);
+    SendMessageW(dlgData.hEditKey, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hLblAction = CreateWindowW(L"STATIC", L"Action:", WS_VISIBLE | WS_CHILD,
+        20, 64, 80, 20, hDlgWnd, NULL, NULL, NULL);
+    SendMessageW(hLblAction, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    dlgData.hComboAction = CreateWindowW(L"COMBOBOX", L"",
+        WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        100, 62, 135, 100, hDlgWnd, (HMENU)302, NULL, NULL);
+    SendMessageW(dlgData.hComboAction, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessageW(dlgData.hComboAction, CB_ADDSTRING, 0, (LPARAM)L"Down (Press)");
+    SendMessageW(dlgData.hComboAction, CB_ADDSTRING, 0, (LPARAM)L"Up (Release)");
+    bool curIsUp = (events[itemIndex].flags & KEYEVENTF_KEYUP);
+    SendMessageW(dlgData.hComboAction, CB_SETCURSEL, curIsUp ? 1 : 0, 0);
+
+    HWND hBtnOk = CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+        45, 105, 75, 26, hDlgWnd, (HMENU)IDOK, NULL, NULL);
+    SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hBtnCancel = CreateWindowW(L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        140, 105, 75, 26, hDlgWnd, (HMENU)IDCANCEL, NULL, NULL);
+    SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    EnableWindow(g_hWnd, FALSE);
+    SetFocus(dlgData.hEditKey);
+    SendMessageW(dlgData.hEditKey, EM_SETSEL, 0, -1);
+
+    MSG msg = {};
+    while (IsWindow(hDlgWnd) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(hDlgWnd, WM_COMMAND, MAKEWPARAM(IDOK, 0), (LPARAM)hBtnOk);
+                continue;
+            } else if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(hDlgWnd, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), (LPARAM)hBtnCancel);
+                continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    EnableWindow(g_hWnd, TRUE);
+    SetFocus(g_hListTimeline);
+
+    if (dlgData.confirmed) {
+        uint16_t vk = 0, scan = 0;
+        uint32_t flags = 0;
+        if (ParseKeyString(dlgData.keyStr, vk, scan, flags)) {
+            if (dlgData.isUp) {
+                flags |= KEYEVENTF_KEYUP;
+            }
+            events[itemIndex].vkCode = vk;
+            events[itemIndex].scanCode = scan;
+            events[itemIndex].flags = flags;
+
+            MacroRecorder::Instance().SetEvents(events);
+            g_isUnsaved = true;
+            UpdateUIStatus();
+            RefreshTimelineList();
+        } else {
+            MessageBoxW(g_hWnd, L"Unrecognized key name. Try a character like 's', 'a', or names like 'Enter', 'Space', 'Shift', 'F1'.", L"Invalid Key", MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
+// Add event manually
+void PromptAddEvent() {
+    struct AddDlgData {
+        HWND hEditKey;
+        HWND hComboAction;
+        HWND hEditDelay;
+        bool confirmed;
+        std::wstring keyStr;
+        int actionSel; // 0: Press (Down + Up), 1: Down only, 2: Up only
+        int delayMs;
+        int holdMs;
+    } dlgData = { NULL, NULL, NULL, false, L"", 0, 100, 50 };
+
+    auto AddDlgProc = [](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        AddDlgData* pData = reinterpret_cast<AddDlgData*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+        if (msg == WM_COMMAND) {
+            int id = LOWORD(wParam);
+            if (id == IDOK && pData) {
+                wchar_t bufKey[64];
+                GetWindowTextW(pData->hEditKey, bufKey, 64);
+                pData->keyStr = bufKey;
+
+                wchar_t bufDelay[32];
+                GetWindowTextW(pData->hEditDelay, bufDelay, 32);
+                pData->delayMs = _wtoi(bufDelay);
+                if (pData->delayMs < 0) pData->delayMs = 0;
+
+                pData->actionSel = (int)SendMessageW(pData->hComboAction, CB_GETCURSEL, 0, 0);
+                pData->confirmed = true;
+                DestroyWindow(hWnd);
+                return 0;
+            } else if (id == IDCANCEL) {
+                DestroyWindow(hWnd);
+                return 0;
+            }
+        }
+        return DefWindowProcW(hWnd, msg, wParam, lParam);
+    };
+
+    const wchar_t ADD_DLG_CLASS[] = L"KeyTaskAddEventClass";
+    static bool s_addClassRegistered = false;
+    if (!s_addClassRegistered) {
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = AddDlgProc;
+        wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = ADD_DLG_CLASS;
+        wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        RegisterClassW(&wc);
+        s_addClassRegistered = true;
+    }
+
+    RECT parentRect;
+    GetWindowRect(g_hWnd, &parentRect);
+
+    HWND hDlgWnd = CreateWindowExW(
+        WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
+        ADD_DLG_CLASS, L"Add Keystroke Event",
+        WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        parentRect.left + 75, parentRect.top + 110,
+        290, 220,
+        g_hWnd, NULL, GetModuleHandleW(NULL), NULL
+    );
+
+    if (!hDlgWnd) return;
+
+    SetWindowLongPtrW(hDlgWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&dlgData));
+
+    HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    HWND hLblKey = CreateWindowW(L"STATIC", L"Key (e.g. s, Enter, Space, Shift, F5):", WS_VISIBLE | WS_CHILD,
+        20, 12, 240, 20, hDlgWnd, NULL, NULL, NULL);
+    SendMessageW(hLblKey, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    dlgData.hEditKey = CreateWindowW(L"EDIT", L"s",
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
+        20, 32, 235, 24, hDlgWnd, (HMENU)401, NULL, NULL);
+    SendMessageW(dlgData.hEditKey, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hLblAction = CreateWindowW(L"STATIC", L"Action:", WS_VISIBLE | WS_CHILD,
+        20, 66, 80, 20, hDlgWnd, NULL, NULL, NULL);
+    SendMessageW(hLblAction, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    dlgData.hComboAction = CreateWindowW(L"COMBOBOX", L"",
+        WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        105, 64, 150, 110, hDlgWnd, (HMENU)402, NULL, NULL);
+    SendMessageW(dlgData.hComboAction, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessageW(dlgData.hComboAction, CB_ADDSTRING, 0, (LPARAM)L"Full Press (Down+Up)");
+    SendMessageW(dlgData.hComboAction, CB_ADDSTRING, 0, (LPARAM)L"Down Only");
+    SendMessageW(dlgData.hComboAction, CB_ADDSTRING, 0, (LPARAM)L"Up Only");
+    SendMessageW(dlgData.hComboAction, CB_SETCURSEL, 0, 0);
+
+    HWND hLblDelay = CreateWindowW(L"STATIC", L"Delay Before (ms):", WS_VISIBLE | WS_CHILD,
+        20, 100, 120, 20, hDlgWnd, NULL, NULL, NULL);
+    SendMessageW(hLblDelay, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    dlgData.hEditDelay = CreateWindowW(L"EDIT", L"100",
+        WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER,
+        145, 98, 110, 24, hDlgWnd, (HMENU)403, NULL, NULL);
+    SendMessageW(dlgData.hEditDelay, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hBtnOk = CreateWindowW(L"BUTTON", L"Add", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
+        55, 140, 75, 26, hDlgWnd, (HMENU)IDOK, NULL, NULL);
+    SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    HWND hBtnCancel = CreateWindowW(L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
+        150, 140, 75, 26, hDlgWnd, (HMENU)IDCANCEL, NULL, NULL);
+    SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    EnableWindow(g_hWnd, FALSE);
+    SetFocus(dlgData.hEditKey);
+    SendMessage(dlgData.hEditKey, EM_SETSEL, 0, -1);
+
+    MSG msg = {};
+    while (IsWindow(hDlgWnd) && GetMessageW(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_KEYDOWN) {
+            if (msg.wParam == VK_RETURN) {
+                SendMessageW(hDlgWnd, WM_COMMAND, MAKEWPARAM(IDOK, 0), (LPARAM)hBtnOk);
+                continue;
+            } else if (msg.wParam == VK_ESCAPE) {
+                SendMessageW(hDlgWnd, WM_COMMAND, MAKEWPARAM(IDCANCEL, 0), (LPARAM)hBtnCancel);
+                continue;
+            }
+        }
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    EnableWindow(g_hWnd, TRUE);
+    SetFocus(g_hListTimeline);
+
+    if (dlgData.confirmed) {
+        uint16_t vk = 0, scan = 0;
+        uint32_t flags = 0;
+        if (ParseKeyString(dlgData.keyStr, vk, scan, flags)) {
+            auto events = MacroRecorder::Instance().GetEvents();
+            int selected = ListView_GetNextItem(g_hListTimeline, -1, LVNI_SELECTED);
+            size_t insertPos = (selected >= 0 && selected < static_cast<int>(events.size())) ? (selected + 1) : events.size();
+
+            if (dlgData.actionSel == 0) {
+                // Full press: Down event + Up event with 50ms hold
+                KeyEvent evDown;
+                evDown.delayMs = static_cast<uint32_t>(dlgData.delayMs);
+                evDown.vkCode = vk;
+                evDown.scanCode = scan;
+                evDown.flags = flags;
+
+                KeyEvent evUp;
+                evUp.delayMs = 50; // default 50ms hold
+                evUp.vkCode = vk;
+                evUp.scanCode = scan;
+                evUp.flags = flags | KEYEVENTF_KEYUP;
+
+                events.insert(events.begin() + insertPos, evDown);
+                events.insert(events.begin() + insertPos + 1, evUp);
+            } else if (dlgData.actionSel == 1) {
+                // Down only
+                KeyEvent ev;
+                ev.delayMs = static_cast<uint32_t>(dlgData.delayMs);
+                ev.vkCode = vk;
+                ev.scanCode = scan;
+                ev.flags = flags;
+                events.insert(events.begin() + insertPos, ev);
+            } else {
+                // Up only
+                KeyEvent ev;
+                ev.delayMs = static_cast<uint32_t>(dlgData.delayMs);
+                ev.vkCode = vk;
+                ev.scanCode = scan;
+                ev.flags = flags | KEYEVENTF_KEYUP;
+                events.insert(events.begin() + insertPos, ev);
+            }
+
+            MacroRecorder::Instance().SetEvents(events);
+            g_isUnsaved = true;
+            UpdateUIStatus();
+            RefreshTimelineList();
+        } else {
+            MessageBoxW(g_hWnd, L"Unrecognized key name. Try a character like 's', 'a', or names like 'Enter', 'Space', 'Shift', 'F1'.", L"Invalid Key", MB_OK | MB_ICONWARNING);
+        }
+    }
+}
+
 void PromptEditDelay() {
     int selected = ListView_GetNextItem(g_hListTimeline, -1, LVNI_SELECTED);
     if (selected < 0) {
@@ -706,14 +1033,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         lvc.cx = 95;  lvc.pszText = const_cast<wchar_t*>(L"Hold Duration"); ListView_InsertColumn(g_hListTimeline, 3, &lvc);
         lvc.cx = 85;  lvc.pszText = const_cast<wchar_t*>(L"Delay After");   ListView_InsertColumn(g_hListTimeline, 4, &lvc);
 
-        g_hBtnEditDelay = CreateWindowW(L"BUTTON", L"Edit Delay...", WS_CHILD | BS_PUSHBUTTON,
-            15, 430, 100, 28, hWnd, (HMENU)IDC_BTN_EDIT_DELAY, NULL, NULL);
+        g_hBtnAddEvent = CreateWindowW(L"BUTTON", L"+ Add Key...", WS_CHILD | BS_PUSHBUTTON,
+            15, 430, 90, 28, hWnd, (HMENU)IDC_BTN_ADD_EVENT, NULL, NULL);
 
-        g_hBtnDelEvent = CreateWindowW(L"BUTTON", L"Delete Event", WS_CHILD | BS_PUSHBUTTON,
-            125, 430, 100, 28, hWnd, (HMENU)IDC_BTN_DEL_EVENT, NULL, NULL);
+        g_hBtnEditDelay = CreateWindowW(L"BUTTON", L"Edit Delay...", WS_CHILD | BS_PUSHBUTTON,
+            110, 430, 95, 28, hWnd, (HMENU)IDC_BTN_EDIT_DELAY, NULL, NULL);
+
+        g_hBtnDelEvent = CreateWindowW(L"BUTTON", L"Delete", WS_CHILD | BS_PUSHBUTTON,
+            210, 430, 85, 28, hWnd, (HMENU)IDC_BTN_DEL_EVENT, NULL, NULL);
 
         g_hBtnClearAll = CreateWindowW(L"BUTTON", L"Clear All", WS_CHILD | BS_PUSHBUTTON,
-            305, 430, 95, 28, hWnd, (HMENU)IDC_BTN_CLEAR_ALL, NULL, NULL);
+            300, 430, 100, 28, hWnd, (HMENU)IDC_BTN_CLEAR_ALL, NULL, NULL);
 
         // Apply clean standard font
         const HWND controls[] = {
@@ -721,7 +1051,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             hSpeedLbl, g_hEditSpeed, hLoopsLbl, g_hEditLoops,
             g_hChkInfinite, g_hChkTimed, g_hEditTime,
             hIntervalLbl, g_hEditInterval, g_hBtnToggleView,
-            g_hListTimeline, g_hBtnEditDelay, g_hBtnDelEvent, g_hBtnClearAll
+            g_hListTimeline, g_hBtnAddEvent, g_hBtnEditDelay, g_hBtnDelEvent, g_hBtnClearAll
         };
         for (HWND ctrl : controls) {
             SendMessageW(ctrl, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -811,6 +1141,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case IDC_BTN_TOGGLE_VIEW:
             SetTimelineOpen(!g_isTimelineOpen);
             break;
+        case IDC_BTN_ADD_EVENT:
+            PromptAddEvent();
+            break;
         case IDC_BTN_EDIT_DELAY:
             PromptEditDelay();
             break;
@@ -829,8 +1162,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (lpnmh->idFrom == IDC_LIST_TIMELINE && lpnmh->code == NM_DBLCLK) {
             LPNMITEMACTIVATE lpnmitem = (LPNMITEMACTIVATE)lParam;
             if (lpnmitem->iItem >= 0) {
-                // Pass the specific subitem column that was double-clicked
-                EditTimelineCell(lpnmitem->iItem, lpnmitem->iSubItem);
+                if (lpnmitem->iSubItem == 1 || lpnmitem->iSubItem == 2) {
+                    // Double-clicked "Key" or "Action" column -> Edit the Key / Action
+                    PromptEditKey(lpnmitem->iItem);
+                } else {
+                    // Double-clicked "Hold Duration" or "Delay After" column -> Edit timing
+                    EditTimelineCell(lpnmitem->iItem, lpnmitem->iSubItem);
+                }
             }
         }
         break;
