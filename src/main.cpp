@@ -431,9 +431,7 @@ void EditTimelineCell(int itemIndex, int subItem) {
 
         // Calculate current hold duration
         int downIdx = -1;
-        uint32_t holdTime = 0;
         for (int i = itemIndex - 1; i >= 0; i--) {
-            holdTime += events[i + 1].delayMs;
             if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
                 downIdx = i;
                 break;
@@ -442,6 +440,11 @@ void EditTimelineCell(int itemIndex, int subItem) {
         if (downIdx == -1) {
             MessageBoxW(g_hWnd, L"Cannot find matching Key Down event.", L"Error", MB_OK | MB_ICONERROR);
             return;
+        }
+
+        uint32_t holdTime = 0;
+        for (int i = downIdx + 1; i <= itemIndex; i++) {
+            holdTime += events[i].delayMs;
         }
 
         currentVal = holdTime;
@@ -554,19 +557,24 @@ void EditTimelineCell(int itemIndex, int subItem) {
         if (isHoldDuration) {
             uint16_t vk = events[itemIndex].vkCode;
             int downIdx = -1;
-            uint32_t intermediateDelay = 0;
             for (int i = itemIndex - 1; i >= 0; i--) {
                 if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
                     downIdx = i;
                     break;
                 }
-                intermediateDelay += events[i + 1].delayMs;
             }
             if (downIdx != -1) {
-                if (static_cast<uint32_t>(newVal) >= intermediateDelay) {
-                    events[downIdx + 1].delayMs = static_cast<uint32_t>(newVal) - intermediateDelay;
+                // Total hold time = sum(events[k].delayMs) for k in [downIdx+1, itemIndex].
+                // Keep intermediate events intact and adjust events[itemIndex].delayMs:
+                uint32_t intermediate = 0;
+                for (int k = downIdx + 1; k < itemIndex; k++) {
+                    intermediate += events[k].delayMs;
+                }
+                uint32_t targetVal = static_cast<uint32_t>(newVal);
+                if (targetVal >= intermediate) {
+                    events[itemIndex].delayMs = targetVal - intermediate;
                 } else {
-                    events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
+                    events[itemIndex].delayMs = 0;
                 }
             }
         } else {
@@ -939,7 +947,7 @@ void ClearAllEvents() {
 
     if (MessageBoxW(g_hWnd, L"Are you sure you want to clear all recorded events?", L"Clear All", MB_YESNO | MB_ICONQUESTION) == IDYES) {
         MacroRecorder::Instance().SetEvents({});
-        g_isUnsaved = true;
+        g_isUnsaved = false;
         UpdateUIStatus();
         RefreshTimelineList();
     }
@@ -1165,7 +1173,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (lpnmitem->iSubItem == 1 || lpnmitem->iSubItem == 2) {
                     // Double-clicked "Key" or "Action" column -> Edit the Key / Action
                     PromptEditKey(lpnmitem->iItem);
-                } else {
+                } else if (lpnmitem->iSubItem == 3 || lpnmitem->iSubItem == 4) {
                     // Double-clicked "Hold Duration" or "Delay After" column -> Edit timing
                     EditTimelineCell(lpnmitem->iItem, lpnmitem->iSubItem);
                 }
