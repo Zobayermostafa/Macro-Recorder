@@ -83,11 +83,10 @@ static HBRUSH g_hBrushGray  = NULL;
 // Forward declarations
 bool SaveMacroDialog();
 void RefreshTimelineList();
+void EditTimelineCell(int itemIndex, int subItem);
 
 void SetTimelineOpen(bool open) {
     g_isTimelineOpen = open;
-    RECT rect;
-    GetWindowRect(g_hWnd, &rect);
     int width = 450;
     int height = g_isTimelineOpen ? 520 : 255;
     SetWindowPos(g_hWnd, NULL, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER);
@@ -114,7 +113,6 @@ void RefreshTimelineList() {
     const auto& events = MacroRecorder::Instance().GetEvents();
 
     // Calculate hold duration by matching key-down events with their subsequent key-up
-    // Key: vkCode, Value: cumulative timestamp when KeyDown fired
     std::vector<std::wstring> holdDurations(events.size(), L"-");
     std::map<uint16_t, std::pair<uint64_t, size_t>> activePresses;
 
@@ -124,10 +122,8 @@ void RefreshTimelineList() {
         bool isUp = (events[i].flags & KEYEVENTF_KEYUP);
 
         if (!isUp) {
-            // Key Down: record start time and event index
             activePresses[events[i].vkCode] = { runningTimeMs, i };
         } else {
-            // Key Up: check if we had an active key down
             auto it = activePresses.find(events[i].vkCode);
             if (it != activePresses.end()) {
                 uint64_t holdMs = runningTimeMs - it->second.first;
@@ -162,7 +158,7 @@ void RefreshTimelineList() {
         // Column 3: Hold Duration
         ListView_SetItemText(g_hListTimeline, static_cast<int>(i), 3, const_cast<wchar_t*>(holdDurations[i].c_str()));
 
-        // Column 4: Delay Before / Interval
+        // Column 4: Delay After (Interval before this event)
         std::wstring delayStr = std::to_wstring(ev.delayMs) + L" ms";
         ListView_SetItemText(g_hListTimeline, static_cast<int>(i), 4, const_cast<wchar_t*>(delayStr.c_str()));
     }
@@ -407,97 +403,79 @@ void OpenMacroDialog() {
     }
 }
 
-// Edit delay dialog
-static int s_editDelayTargetIndex = -1;
-static uint32_t s_editDelayCurrentVal = 0;
+// Edit delay / time box directly by double clicking
+void EditTimelineCell(int itemIndex, int subItem) {
+    auto events = MacroRecorder::Instance().GetEvents();
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(events.size())) return;
 
-INT_PTR CALLBACK EditDelayDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM) {
-    switch (msg) {
-    case WM_INITDIALOG: {
-        SetDlgItemInt(hDlg, 201, s_editDelayCurrentVal, FALSE);
-        SetFocus(GetDlgItem(hDlg, 201));
-        SendDlgItemMessageW(hDlg, 201, EM_SETSEL, 0, -1);
-        return FALSE;
-    }
-    case WM_COMMAND: {
-        int id = LOWORD(wParam);
-        if (id == IDOK) {
-            BOOL success = FALSE;
-            UINT val = GetDlgItemInt(hDlg, 201, &success, FALSE);
-            if (success) {
-                s_editDelayCurrentVal = val;
-                EndDialog(hDlg, IDOK);
-            }
-            return TRUE;
-        } else if (id == IDCANCEL) {
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
+    // Subitem 3: Hold Duration (for key-up events)
+    // Subitem 4 (or default): Delay Before (Interval)
+    bool isHoldDuration = (subItem == 3);
+    uint32_t currentVal = 0;
+    std::wstring title = L"Edit Delay (ms)";
+    std::wstring label = L"Delay before event (ms):";
+
+    if (isHoldDuration) {
+        // Find corresponding key-down event backwards
+        uint16_t vk = events[itemIndex].vkCode;
+        bool isUp = (events[itemIndex].flags & KEYEVENTF_KEYUP);
+        if (!isUp) {
+            MessageBoxW(g_hWnd, L"To edit hold duration, double-click the 'Up' row for this key, or edit the Delay column directly.", L"Tip", MB_OK | MB_ICONINFORMATION);
+            return;
         }
-        break;
+
+        // Calculate current hold duration
+        int downIdx = -1;
+        uint32_t holdTime = 0;
+        for (int i = itemIndex - 1; i >= 0; i--) {
+            holdTime += events[i + 1].delayMs;
+            if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
+                downIdx = i;
+                break;
+            }
+        }
+        if (downIdx == -1) {
+            MessageBoxW(g_hWnd, L"Cannot find matching Key Down event.", L"Error", MB_OK | MB_ICONERROR);
+            return;
+        }
+
+        currentVal = holdTime;
+        title = L"Edit Hold Duration";
+        label = L"New Key Hold Duration (ms):";
+    } else {
+        currentVal = events[itemIndex].delayMs;
     }
-    }
-    return FALSE;
-}
 
-void PromptEditDelay() {
-    int selected = ListView_GetNextItem(g_hListTimeline, -1, LVNI_SELECTED);
-    if (selected < 0) {
-        MessageBoxW(g_hWnd, L"Please select an event from the list to edit its delay.", L"No Selection", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
-
-    const auto& events = MacroRecorder::Instance().GetEvents();
-    if (selected >= static_cast<int>(events.size())) return;
-
-    s_editDelayTargetIndex = selected;
-    s_editDelayCurrentVal = events[selected].delayMs;
-
-    // Build modal dialog template in memory
-    #pragma pack(push, 2)
-    struct DLG_TEMPLATE {
-        DWORD style;
-        DWORD dwExtendedStyle;
-        WORD cdit;
-        short x, y, cx, cy;
-        WORD menu, windowClass, title;
-    } dlg = {
-        WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER,
-        0, 0, 0, 0, 160, 70, 0, 0, 0
-    };
-    #pragma pack(pop)
-
-    // Simpler fallback: programmatic dialog using a quick helper window
     HWND hInputWnd = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST,
-        L"#32770", L"Edit Event Delay",
+        L"#32770", title.c_str(),
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-        0, 0, 240, 130, g_hWnd, NULL, NULL, NULL
+        0, 0, 260, 135, g_hWnd, NULL, NULL, NULL
     );
 
-    // Center window
     RECT parentRect;
     GetWindowRect(g_hWnd, &parentRect);
     SetWindowPos(hInputWnd, NULL,
-        parentRect.left + 80, parentRect.top + 100,
-        240, 130, SWP_NOZORDER);
+        parentRect.left + 90, parentRect.top + 140,
+        260, 135, SWP_NOZORDER);
 
     HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
 
-    HWND hLbl = CreateWindowW(L"STATIC", L"Delay before event (ms):", WS_VISIBLE | WS_CHILD,
-        20, 15, 180, 20, hInputWnd, NULL, NULL, NULL);
+    HWND hLbl = CreateWindowW(L"STATIC", label.c_str(), WS_VISIBLE | WS_CHILD,
+        20, 15, 210, 20, hInputWnd, NULL, NULL, NULL);
     SendMessageW(hLbl, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    HWND hEdit = CreateWindowW(L"EDIT", std::to_wstring(s_editDelayCurrentVal).c_str(),
+    HWND hEdit = CreateWindowW(L"EDIT", std::to_wstring(currentVal).c_str(),
         WS_VISIBLE | WS_CHILD | WS_BORDER | ES_NUMBER | ES_AUTOHSCROLL,
-        20, 38, 185, 22, hInputWnd, (HMENU)201, NULL, NULL);
+        20, 38, 205, 22, hInputWnd, (HMENU)201, NULL, NULL);
     SendMessageW(hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     HWND hBtnOk = CreateWindowW(L"BUTTON", L"OK", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON,
-        40, 68, 65, 24, hInputWnd, (HMENU)IDOK, NULL, NULL);
+        50, 68, 70, 24, hInputWnd, (HMENU)IDOK, NULL, NULL);
     SendMessageW(hBtnOk, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     HWND hBtnCancel = CreateWindowW(L"BUTTON", L"Cancel", WS_VISIBLE | WS_CHILD | BS_PUSHBUTTON,
-        120, 68, 65, 24, hInputWnd, (HMENU)IDCANCEL, NULL, NULL);
+        135, 68, 70, 24, hInputWnd, (HMENU)IDCANCEL, NULL, NULL);
     SendMessageW(hBtnCancel, WM_SETFONT, (WPARAM)hFont, TRUE);
 
     EnableWindow(g_hWnd, FALSE);
@@ -516,11 +494,32 @@ void PromptEditDelay() {
             if (id == IDOK) {
                 wchar_t buf[32];
                 GetWindowTextW(hEdit, buf, 32);
-                int newDelay = _wtoi(buf);
-                if (newDelay >= 0) {
-                    std::vector<KeyEvent> updated = MacroRecorder::Instance().GetEvents();
-                    updated[selected].delayMs = static_cast<uint32_t>(newDelay);
-                    MacroRecorder::Instance().SetEvents(updated);
+                int newVal = _wtoi(buf);
+                if (newVal >= 0) {
+                    if (isHoldDuration) {
+                        // Adjust the key up event delay so that the hold time matches newVal
+                        uint16_t vk = events[itemIndex].vkCode;
+                        int downIdx = -1;
+                        uint32_t intermediateDelay = 0;
+                        for (int i = itemIndex - 1; i >= 0; i--) {
+                            if (events[i].vkCode == vk && !(events[i].flags & KEYEVENTF_KEYUP)) {
+                                downIdx = i;
+                                break;
+                            }
+                            intermediateDelay += events[i + 1].delayMs;
+                        }
+                        if (downIdx != -1) {
+                            if (static_cast<uint32_t>(newVal) >= intermediateDelay) {
+                                events[downIdx + 1].delayMs = static_cast<uint32_t>(newVal) - intermediateDelay;
+                            } else {
+                                events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
+                            }
+                        }
+                    } else {
+                        events[itemIndex].delayMs = static_cast<uint32_t>(newVal);
+                    }
+
+                    MacroRecorder::Instance().SetEvents(events);
                     g_isUnsaved = true;
                     UpdateUIStatus();
                     RefreshTimelineList();
@@ -539,6 +538,15 @@ void PromptEditDelay() {
     EnableWindow(g_hWnd, TRUE);
     DestroyWindow(hInputWnd);
     SetFocus(g_hListTimeline);
+}
+
+void PromptEditDelay() {
+    int selected = ListView_GetNextItem(g_hListTimeline, -1, LVNI_SELECTED);
+    if (selected < 0) {
+        MessageBoxW(g_hWnd, L"Please select an event from the list to edit its delay.", L"No Selection", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    EditTimelineCell(selected, 4);
 }
 
 void DeleteSelectedEvent() {
@@ -784,7 +792,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_NOTIFY: {
         LPNMHDR lpnmh = (LPNMHDR)lParam;
         if (lpnmh->idFrom == IDC_LIST_TIMELINE && lpnmh->code == NM_DBLCLK) {
-            PromptEditDelay();
+            LPNMITEMACTIVATE lpnmitem = (LPNMITEMACTIVATE)lParam;
+            if (lpnmitem->iItem >= 0) {
+                // Pass the specific subitem column that was double-clicked
+                EditTimelineCell(lpnmitem->iItem, lpnmitem->iSubItem);
+            }
         }
         break;
     }
