@@ -1,0 +1,9 @@
+﻿# Build outputs
+*.exe
+*.o
+*.obj
+
+# Temporary / editor files
+.vscode/
+.idea/
+*.krec
